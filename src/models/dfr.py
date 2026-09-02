@@ -210,9 +210,54 @@ class RegionalFeatureParams:
 
 @torch.no_grad()
 def _regional_feature_map(extractor: _FeatureExtractor, images: torch.Tensor,
-                           params: RegionalFeatureParams) -> torch.Tensor:
+                           params: RegionalFeatureParams,
+                           chunk_size: Optional[int] = None) -> torch.Tensor:
     """สร้าง multi-scale regional feature map f(x) ตาม paper eq. 1-3 (align
-    → aggregate → concatenate):
+    → aggregate → concatenate), ประมวลผลเป็น "chunk" ย่อยตามแกน batch ถ้า
+    ระบุ chunk_size — เพื่อจำกัด peak GPU memory โดยไม่เปลี่ยนผลลัพธ์ทาง
+    คณิตศาสตร์เลยแม้แต่น้อย (chunk แล้วก็ได้ผลเหมือนไม่ chunk ทุกประการ
+    เพราะแต่ละภาพใน batch ไม่ได้ขึ้นกับกันและกันในทุกขั้นตอนนี้)
+
+    **ทำไมต้อง chunk**: การ align (ขั้น 1) resize feature map ทุก scale
+    ให้เท่ากับ "ขนาดภาพ input" (เช่น 224×224) ตาม paper eq. 1 ตรงๆ ทำให้
+    scale ลึกๆ ที่มี channel เยอะ (เช่น VGG19 512-channel layer) กลายเป็น
+    tensor ขนาดมหาศาลก่อนจะถูกย่อกลับด้วย aggregate — ตัวอย่าง: batch=32,
+    channel=512, ภาพ 224×224 → 32×512×224×224×4 byte ≈ 13 GB สำหรับ
+    "ค่ากลาง" (intermediate) แค่ 1 scale จาก 12 scale เท่านั้น บน GPU ที่มี
+    memory เหลือไม่มาก (โดยเฉพาะตอนรันหลาย seed ต่อกันในโปรเซสเดียว ที่
+    CUDA caching allocator อาจยังไม่คืน memory ของ seed ก่อนหน้าให้ OS)
+    ทำให้ OOM ได้ง่ายแม้ GPU จะมี VRAM รวมเยอะก็ตาม — chunk ตาม batch ทำให้
+    "ค่ากลาง" นี้เล็กลงตามสัดส่วน โดยผลลัพธ์สุดท้าย (หลัง aggregate ซึ่ง
+    เล็กกว่ามาก) เหมือนเดิมในทางคณิตศาสตร์ (ต่างกันแค่ floating-point
+    rounding ระดับ ~1e-6 relative จาก batch-size-dependent conv/BN
+    non-associativity — ยืนยันด้วย diagnostic script แล้วว่าไม่ใช่
+    approximation เชิง algorithm ดู README หัวข้อ "Chunked feature
+    extraction")
+
+    ตั้ง cfg.DFR_FEATURE_CHUNK_SIZE ควบคุมค่านี้ — None หรือ >= ขนาด batch
+    จริง = ไม่ chunk (พฤติกรรมเดิม) ถ้าเจอ CUDA OOM ที่บรรทัดนี้ ให้ลดค่า
+    นี้ลง (เช่น 4 หรือ 2) โดยไม่ต้องลด cfg.BATCH_SIZE ของ DataLoader เอง
+    (ซึ่งจะกระทบ Adam gradient estimate ทางอ้อม)
+
+    คืน [B, C_total, h_o, w_o]
+    """
+    B = images.shape[0]
+    if chunk_size is None or chunk_size >= B:
+        return _regional_feature_map_impl(extractor, images, params)
+
+    outputs = []
+    for i in range(0, B, chunk_size):
+        outputs.append(
+            _regional_feature_map_impl(extractor, images[i:i + chunk_size], params))
+    return torch.cat(outputs, dim=0)
+
+
+@torch.no_grad()
+def _regional_feature_map_impl(extractor: _FeatureExtractor, images: torch.Tensor,
+                                params: RegionalFeatureParams) -> torch.Tensor:
+    """align → aggregate → concatenate (paper eq. 1-3) สำหรับ 1 chunk/batch
+    เดียว — ดู docstring ของ _regional_feature_map() (wrapper ด้านบน)
+    สำหรับคำอธิบายแต่ละขั้นตอนแบบเต็ม
 
       1) Align (eq. 1): resize ทุก scale ให้เท่ากับ "ขนาดภาพ input"
          (params.image_size) ด้วย nearest-neighbor interpolation (ตาม
@@ -226,8 +271,6 @@ def _regional_feature_map(extractor: _FeatureExtractor, images: torch.Tensor,
 
       3) Concatenate (eq. 3): รวมทุก scale ตามแกน channel → f(x) ขนาด
          [B, c_o, h_o, w_o] เดียว, c_o = ผลรวม channel ของทุก scale
-
-    คืน [B, C_total, h_o, w_o]
     """
     feats = extractor(images)  # list of [B, C_l, H_l, W_l], คนละ resolution กัน
     h, w = params.image_size
@@ -246,6 +289,7 @@ def _regional_feature_map(extractor: _FeatureExtractor, images: torch.Tensor,
         agg = F.avg_pool2d(aligned, kernel_size=params.agg_kernel,
                             stride=params.agg_stride)
         aggregated.append(agg)
+        del aligned  # ปล่อย intermediate ตัวใหญ่ทันที ไม่รอ loop ถัดไป reassign ทับ
 
     return torch.cat(aggregated, dim=1)  # [B, C_total, h_o, w_o]
 
@@ -264,13 +308,14 @@ class _ChannelZScore:
         self.std: Optional[torch.Tensor] = None   # [C]
 
     @torch.no_grad()
-    def fit(self, extractor, loader, device, params: RegionalFeatureParams) -> None:
+    def fit(self, extractor, loader, device, params: RegionalFeatureParams,
+            chunk_size: Optional[int] = None) -> None:
         n = 0
         s1 = None  # sum
         s2 = None  # sum of squares
         for batch in loader:
             images = batch[0].to(device)
-            feat = _regional_feature_map(extractor, images, params)  # [B,C,H,W]
+            feat = _regional_feature_map(extractor, images, params, chunk_size)  # [B,C,H,W]
             b, c, h, w = feat.shape
             flat = feat.permute(1, 0, 2, 3).reshape(c, -1)  # [C, B*H*W]
             if s1 is None:
@@ -327,7 +372,8 @@ class _DFRCae(nn.Module):
 @torch.no_grad()
 def _estimate_latent_dim(extractor, loader, device, params: RegionalFeatureParams,
                           variance_ratio: float, sample_size: int,
-                          znorm: Optional[_ChannelZScore]) -> int:
+                          znorm: Optional[_ChannelZScore],
+                          chunk_size: Optional[int] = None) -> int:
     """ประมาณ latent dimension c_d ด้วย PCA บน subset ของ regional feature
     vector (paper section IV-A.3: "estimate the latent code dimension with
     PCA such that 90% variance is just explained") — สุ่มเก็บ vector จาก
@@ -341,7 +387,7 @@ def _estimate_latent_dim(extractor, loader, device, params: RegionalFeatureParam
         if n_collected >= sample_size:
             break
         images = batch[0].to(device)
-        feat = _regional_feature_map(extractor, images, params)  # [B,C,H,W]
+        feat = _regional_feature_map(extractor, images, params, chunk_size)  # [B,C,H,W]
         if znorm is not None:
             feat = znorm.apply(feat)
         b, c, h, w = feat.shape
@@ -406,6 +452,12 @@ class DFR:
         self.c_in: Optional[int] = None
         self.latent_dim: Optional[int] = None
         self.history = {"train_loss": []}
+        # จำกัด peak GPU memory ของขั้น align (paper eq. 1) โดยไม่กระทบ
+        # cfg.BATCH_SIZE ของ DataLoader เอง — ดู docstring ของ
+        # _regional_feature_map() ว่าทำไมขั้นนี้กิน memory เยอะเป็นพิเศษ
+        # และทำไม chunk แล้วผลลัพธ์เหมือนเดิมในทางคณิตศาสตร์ (ต่างกันแค่
+        # floating-point rounding ระดับ ~1e-6 relative ไม่ใช่ approximation)
+        self.chunk_size = cfg.DFR_FEATURE_CHUNK_SIZE
 
     def fit(self, normal_loader) -> None:
         """เทรน CAE จากภาพ normal เท่านั้น — ห้ามแตะ defect label ใดๆ
@@ -422,15 +474,17 @@ class DFR:
         if self.znorm is not None:
             logger.info("Fitting channel-wise z-score stats จาก train-normal...")
             self.znorm.fit(self.extractor, normal_loader, self.device,
-                           self.rf_params)
+                           self.rf_params, self.chunk_size)
 
         # ── infer c_in + spatial shape จาก 1 batch ─────────────────────
         first_batch = next(iter(normal_loader))
         with torch.no_grad():
             probe = _regional_feature_map(
-                self.extractor, first_batch[0].to(self.device), self.rf_params)
+                self.extractor, first_batch[0].to(self.device), self.rf_params,
+                self.chunk_size)
         self.c_in = probe.shape[1]
         self.embed_spatial_shape = tuple(probe.shape[-2:])
+        del probe
 
         # ── 2) latent dim ────────────────────────────────────────────
         if self.cfg.DFR_LATENT_DIM is not None:
@@ -441,7 +495,7 @@ class DFR:
             self.latent_dim = _estimate_latent_dim(
                 self.extractor, normal_loader, self.device, self.rf_params,
                 self.cfg.DFR_PCA_VARIANCE_RATIO, self.cfg.DFR_PCA_SAMPLE_SIZE,
-                self.znorm)
+                self.znorm, self.chunk_size)
 
         logger.info(f"CAE: c_in={self.c_in}  c_latent={self.latent_dim}  "
                     f"spatial={self.embed_spatial_shape}")
@@ -460,7 +514,7 @@ class DFR:
                 images = batch[0].to(self.device)
                 with torch.no_grad():
                     feat = _regional_feature_map(
-                        self.extractor, images, self.rf_params)
+                        self.extractor, images, self.rf_params, self.chunk_size)
                     if self.znorm is not None:
                         feat = self.znorm.apply(feat)
 
@@ -486,6 +540,8 @@ class DFR:
                             f"train_loss={avg_loss:.6f}  lr={sched.get_last_lr()[0]:.2e}")
 
         self.cae.eval()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()  # ปล่อย cache กลับให้ CUDA allocator ก่อนไปทำ score()/seed ถัดไป
         logger.info("DFR.fit() เสร็จสิ้น — CAE พร้อมใช้")
 
     @torch.no_grad()
@@ -505,7 +561,8 @@ class DFR:
             images = images.to(self.device)
             B = images.shape[0]
 
-            feat = _regional_feature_map(self.extractor, images, self.rf_params)
+            feat = _regional_feature_map(self.extractor, images, self.rf_params,
+                                          self.chunk_size)
             assert tuple(feat.shape[-2:]) == (H, W), (
                 f"Spatial shape เปลี่ยนระหว่าง fit() ({H},{W}) กับ score() "
                 f"({tuple(feat.shape[-2:])}) — เช็คว่า IMAGE_SIZE ตรงกันทั้งสองรอบ")
@@ -536,6 +593,9 @@ class DFR:
             labels.extend(list(batch_labels))
             paths.extend(batch_paths)
 
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()  # ปล่อย cache ก่อนจบ score() เช่นกัน (ดู fit())
+
         return ScoreResult(
             image_scores=np.array(image_scores, dtype=np.float64),
             y_true=np.array(y_true, dtype=np.int64),
@@ -545,7 +605,6 @@ class DFR:
             orig_imgs=np.stack(orig_imgs, axis=0),
             preproc_imgs=np.stack(preproc_imgs, axis=0),
         )
-
 
 def _gaussian_smooth(arr: np.ndarray, sigma: float) -> np.ndarray:
     from scipy.ndimage import gaussian_filter

@@ -19,9 +19,13 @@ ConvNeXt-matched variant any time (see below) without touching code.
 
 ## Quickstart
 
-1. Edit `RUN.py` → `OVERRIDES`: set `DATA_ROOT` and (strongly recommended)
-   point `SPLIT_CACHE_PATH` at the **same** `splits/split_assignment.csv`
-   used by `Anomaly-Detection-THESIS` and `PCB-Anomaly-Baselines-PatchCore`.
+1. Edit `RUN.py` → `OVERRIDES`: set `DATA_ROOT`. For a single comparison
+   run against `Anomaly-Detection-THESIS`/`PCB-Anomaly-Baselines-PatchCore`,
+   point `SPLIT_CACHE_PATH` at their **same** `split_assignment.csv` so
+   train/val/test membership matches exactly. For multi-seed runs via
+   `RUN_MULTI_SEED.py`, the default layout instead gives each seed its own
+   `log`/`table`/`split` (see "Multi-seed folder layout" below) — a
+   deliberate trade-off, not an oversight.
 2. `pip install -r requirements.txt`
 3. **Before trusting any result**, run `python tests/heatmap_sanity_check.py`
    with `PRETRAINED=True` (needs internet) and confirm the heatmap
@@ -81,6 +85,52 @@ first**:
 - `tests/heatmap_sanity_check.py` — **content-level** check: does the
   produced heatmap actually track a known synthetic defect location, or
   is it just scattered/structured-but-wrong? See finding below.
+
+## Chunked feature extraction — CUDA OOM fix
+
+Reported on real hardware (Colab, 22GB GPU) during a `RUN_MULTI_SEED.py`
+run: `CUDA out of memory` inside `_regional_feature_map`'s `F.interpolate`
+call. Root cause and fix:
+
+1. **Per-batch cause**: the align step (paper eq. 1) resizes *every* scale
+   to the full input image resolution before pooling it back down. For a
+   deep VGG19 layer (512 channels) at `BATCH_SIZE=32` and `IMAGE_SIZE=224`,
+   that single intermediate tensor is `32×512×224×224×4 bytes ≈ 13 GB` —
+   for one of twelve scales, before aggregation shrinks it back down.
+2. **Cross-seed cause**: `RUN_MULTI_SEED.py` runs many seeds sequentially
+   in one process. Without explicit cleanup, PyTorch's CUDA caching
+   allocator accumulates "reserved but unallocated" memory across seeds —
+   matching the reported error (`20.31 GiB memory in use ... 8.51 GiB is
+   reserved by PyTorch but unallocated`).
+
+Fixes, both on by default:
+
+- **`DFR_FEATURE_CHUNK_SIZE`** (default `8`): `_regional_feature_map`
+  processes the batch in sub-chunks of this size instead of all at once,
+  bounding peak memory for the align step regardless of `BATCH_SIZE`.
+  Verified numerically equivalent to the unchunked path up to
+  floating-point rounding (~1e-6 relative — ordinary batch-size-dependent
+  conv/BatchNorm non-associativity, not an algorithmic approximation; see
+  the diagnostic in this repo's development history). Lower it (e.g. `4`
+  or `2`) if OOM persists — this does **not** require lowering
+  `BATCH_SIZE` itself, which would otherwise also perturb the Adam
+  gradient estimate.
+- **Explicit cleanup**: `DFR.fit()`/`DFR.score()` call
+  `torch.cuda.empty_cache()` after use; `run_dfr.run()` additionally
+  `del`s the model and calls `gc.collect()` before returning;
+  `RUN_MULTI_SEED.py` does the same after every seed (success *or*
+  failure, via a `finally` block) and sets
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` by default (as
+  PyTorch's own OOM message suggests) unless already set.
+
+**Caveat**: this development sandbox has no GPU
+(`torch.cuda.is_available()` is `False` here), so only the CPU-side
+correctness could be verified directly here — the chunking logic is
+confirmed numerically equivalent to the unchunked path (see above), and
+the code review/compile checks all pass, but the *actual* OOM avoidance on
+real GPU hardware could not be executed and observed in this sandbox. If
+`DFR_FEATURE_CHUNK_SIZE=8` still OOMs on your hardware, lower it further
+(down to `1` if needed) — memory scales roughly linearly with this value.
 
 ## Differences from the original DFR paper (stated explicitly)
 
@@ -189,6 +239,27 @@ early-stopping/checkpoint-selection behavior:
 - `history.json`/`training_history.png` have only `train_loss` (normal
   only) — no `val_loss`, `val_loss_normal`, or `val_auroc` curves.
 
+## Multi-seed folder layout — per-seed split (deliberate, not a bug)
+
+`RUN.py`'s default layout is `save/SEED {n}/log`, `save/SEED {n}/table`,
+`save/SEED {n}/split` — every seed gets its **own** `split_assignment.csv`
+too (`RUN_MULTI_SEED.py`'s `TEMPLATE_KEYS` includes `SPLIT_CACHE_PATH`),
+not a single split shared across all seeds.
+
+**Trade-off worth knowing**: with a per-seed split, variance measured
+across seeds now mixes two sources — (1) training randomness (CAE weight
+init/batch order) and (2) different train/val/test membership per seed
+(since the split itself is recomputed per seed). This means per-seed
+results can no longer be compared image-for-image against
+`Anomaly-Detection-THESIS`/`PatchCore` (which use one fixed split), and a
+seed-to-seed metric spread reflects "how sensitive is DFR to both training
+randomness *and* which images landed in train vs. val/test" rather than
+training randomness alone. If instead you want to isolate training
+randomness only (comparable to a fixed-split baseline), remove
+`'SPLIT_CACHE_PATH'` from `TEMPLATE_KEYS` in `RUN_MULTI_SEED.py` and drop
+`"SEED 42"` from `SPLIT_CACHE_PATH` in `RUN.py` — every seed then shares
+one split file, computed once.
+
 ## Differences from `PCB-Anomaly-Baselines-PatchCore` (bugs found + fixed here)
 
 While building this repo I cloned and read the actual PatchCore repo
@@ -203,10 +274,7 @@ rather than copied:
 2. **`RUN_MULTI_SEED.py` requires a `"SEED {n}"` marker** that the
    PatchCore repo's actual `RUN.py` never embeds — running it as-is raises
    `ValueError` immediately. This repo's `RUN.py` embeds `"SEED 42"` in
-   `SAVE_PATH`/`OUTPUT_PATH` by design; `SPLIT_CACHE_PATH` is intentionally
-   left un-templated (`TEMPLATE_KEYS` in `RUN_MULTI_SEED.py` covers only
-   `SAVE_PATH`/`OUTPUT_PATH`) so every seed shares the same split and
-   measured variance reflects training randomness only.
+   every templated path (see "Multi-seed folder layout" above).
 
 Also added (PatchCore has no training loop to need these):
 `src/io_utils.py::save_training_history()`, and
@@ -214,6 +282,36 @@ Also added (PatchCore has no training loop to need these):
 called from `visualize_dfr.py` (in the PatchCore repo this function exists
 but is never called, so `OUTPUT_PATH/README.md` never gets generated
 there).
+
+## Labeled confusion matrix in final_results.json
+
+`final_results_{split}.json`'s `"confusion_matrix"` field used to be a bare
+2×2 array (`metrics["cm"].tolist()`) — you had to already know sklearn's
+`confusion_matrix(y_true, y_pred, labels=[0,1])` convention
+(`[[tn, fp], [fn, tp]]`) to read it. It's now a labeled dict, computed in
+`src/io_utils.py::_labeled_confusion_matrix()` (not in `src/evaluate.py`,
+which must stay byte-identical to the other repos):
+
+```json
+"confusion_matrix": {
+  "tt": 4, "tf": 0, "ft": 1, "ff": 2,
+  "definitions": {
+    "tt": "actual=anomaly(defect), predicted=anomaly -> caught defect (true positive)",
+    "tf": "actual=anomaly(defect), predicted=normal  -> escaped/missed defect (false negative)",
+    "ft": "actual=normal(good),    predicted=anomaly -> false alarm (false positive)",
+    "ff": "actual=normal(good),    predicted=normal  -> correctly auto-cleared (true negative)"
+  },
+  "sklearn_raw_cm": [[2, 1], [0, 4]],
+  "sklearn_raw_cm_note": "... tn==ff, fp==ft, fn==tf, tp==tt ..."
+}
+```
+
+`tt`/`tf`/`ft`/`ff` match the same naming already used in this project's
+`naive_baselines` section (`src/evaluate.py::compute_metrics_from_predictions`)
+— first letter = actual label, second = predicted label, `T`=anomaly/defect,
+`F`=normal/good. Cross-checked against the sibling `metrics` fields:
+`escape_rate = tf/(tt+tf)`, `auto_clear_rate = ff/n`,
+`residual_fcr = ft/(tt+ft)`.
 
 ## Verified end-to-end (dummy data, offline backbone)
 

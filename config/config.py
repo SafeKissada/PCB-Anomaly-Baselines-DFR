@@ -126,6 +126,21 @@ class Config:
     DFR_AGG_KERNEL: int = 4
     DFR_AGG_STRIDE: int = 4
 
+    # จำกัด peak GPU memory ของขั้น "align" (paper eq. 1: resize feature
+    # map ทุก scale ไปเท่ากับขนาดภาพ input เต็มๆ ก่อนย่อกลับด้วย aggregate)
+    # ซึ่งกิน memory มากเป็นพิเศษกับ scale ลึกที่ channel เยอะ (ดู
+    # docstring ของ _regional_feature_map ใน src/models/dfr.py) —
+    # ประมวลผลเป็น chunk ย่อยขนาดนี้แทนการทำทั้ง batch พร้อมกัน โดยผลลัพธ์
+    # เหมือนเดิมในทางคณิตศาสตร์ (ต่างกันแค่ floating-point rounding ระดับ
+    # ~1e-6 relative จาก batch-size-dependent conv/BN non-associativity —
+    # ไม่ใช่ approximation เชิง algorithm ยืนยันด้วย diagnostic script แล้ว)
+    # ค่า default 8 ปลอดภัยสำหรับ
+    # GPU ทั่วไปที่ BATCH_SIZE ปกติ (32) ถ้ายังเจอ CUDA OOM ให้ลดค่านี้ลง
+    # อีก (เช่น 4 หรือ 2) โดยไม่ต้องลด cfg.BATCH_SIZE ของ DataLoader เอง
+    # (ซึ่งจะกระทบ Adam gradient estimate ทางอ้อม) — ตั้งเป็น None เพื่อ
+    # ปิด chunking (ประมวลผลทั้ง batch พร้อมกันเหมือน BATCH_SIZE ปกติ)
+    DFR_FEATURE_CHUNK_SIZE: Optional[int] = 8
+
     # Channel-wise z-score normalization ก่อนเข้า CAE — "ไม่ได้อยู่ใน DFR
     # paper ต้นฉบับ" ปิดไว้เป็น default (False) เพื่อให้ตรง paper เป๊ะ —
     # เปิดได้ (True) ถ้าต้องการให้สอดคล้องกับ convention ของ repo หลัก
@@ -205,6 +220,10 @@ class Config:
             raise ValueError(
                 f"Config.DFR_AGG_KERNEL/DFR_AGG_STRIDE must both be >= 1, got "
                 f"kernel={self.DFR_AGG_KERNEL}, stride={self.DFR_AGG_STRIDE}")
+        if self.DFR_FEATURE_CHUNK_SIZE is not None and self.DFR_FEATURE_CHUNK_SIZE < 1:
+            raise ValueError(
+                f"Config.DFR_FEATURE_CHUNK_SIZE must be None or >= 1, got "
+                f"{self.DFR_FEATURE_CHUNK_SIZE}")
 
         if self.DATA_ROOT == self._DATA_ROOT_PLACEHOLDER:
             raise ValueError(

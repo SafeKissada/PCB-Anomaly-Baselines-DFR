@@ -10,7 +10,15 @@ PCB-Anomaly-Baselines-PatchCore:
 
 OVERRIDES เป็นเพียงที่เดียวที่ต้องแก้ — RUN_MULTI_SEED.py import
 OVERRIDES จากไฟล์นี้โดยตรง ไม่ copy ซ้ำ กัน 2 ไฟล์ไม่ sync กัน
+
+ถ้าเจอ CUDA OOM ระหว่างรัน (โดยเฉพาะกับ VGG19 front-12/16 + BATCH_SIZE
+ใหญ่): ลด DFR_FEATURE_CHUNK_SIZE ด้านล่างก่อน (default 8 → ลองเหลือ 4
+หรือ 2) แทนการลด BATCH_SIZE เอง — ดู docstring ของ
+src/models/dfr.py::_regional_feature_map สำหรับสาเหตุเต็ม
 """
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -29,24 +37,24 @@ OVERRIDES = dict(
     GOOD_DIRNAME="good",
     DEFECT_DIRNAME="defect",
 
-    # ชี้ไปที่ split_assignment.csv เดียวกับ repo หลักและ PatchCore repo
-    # เพื่อให้ train/val/test membership ตรงกันเป๊ะระหว่างทุก baseline —
-    # "ตั้งใจไม่ฝัง 'SEED {n}' ไว้ใน path นี้" (ต่างจาก SAVE_PATH/OUTPUT_PATH
-    # ด้านล่าง) เพราะอยากให้ทุก seed ใน multi-seed run ใช้ split เดียวกัน
-    # เสมอ (วัด variance จาก training/coreset randomness เท่านั้น ไม่ใช่
-    # จาก train/val/test membership ที่ต่างกัน) ถ้าต้องการ split แยกต่อ
-    # seed ให้ฝัง "SEED 42" ไว้ใน path นี้ด้วย แล้วเพิ่ม
-    # 'SPLIT_CACHE_PATH' กลับเข้า TEMPLATE_KEYS ใน RUN_MULTI_SEED.py
+    # โครงสร้างที่ต้องการ: seed 1 --> log/table/split, seed 2 --> log/table/split
+    # แยกกันหมดทุก seed (log, table, "และ" split cache) — ไม่ share
+    # split_assignment.csv ข้าม seed แบบ default เดิมอีกต่อไป
     #
-    # ⚠️ หมายเหตุ: RUN.py ของ PCB-Anomaly-Baselines-PatchCore ต้นฉบับไม่ได้
-    # ฝัง "SEED 42" ไว้ใน SAVE_PATH/OUTPUT_PATH เลย ทำให้ RUN_MULTI_SEED.py
-    # ของ repo นั้น raise ValueError ทันทีถ้ารันจริง (marker ที่มันเช็คหา
-    # ไม่มีอยู่ใน OVERRIDES) — ไฟล์นี้แก้ไขจุดนั้นแล้วโดยฝัง "SEED 42" ไว้
-    # ใน SAVE_PATH/OUTPUT_PATH ให้ครบ แนะนำให้ backport การแก้นี้กลับไปที่
-    # PCB-Anomaly-Baselines-PatchCore ด้วย (ดู README)
-    SPLIT_CACHE_PATH="splits/split_assignment.csv",
-    SAVE_PATH="save/logs/SEED 42",
-    OUTPUT_PATH="save/results/SEED 42",
+    # **Trade-off ที่ควรรู้ก่อนตัดสินใจแบบนี้** (เขียนไว้ให้ชัด เพราะเป็นจุด
+    # ที่กระทบการตีความผลจริง): variance ที่วัดได้ข้าม seed ตอนนี้จะปนกัน
+    # 2 แหล่ง — (1) training randomness (CAE weight init/batch order) และ
+    # (2) train/val/test membership ที่ต่างกันในแต่ละ seed (เพราะ
+    # SPLIT_CACHE_PATH ถูก re-compute ใหม่ทุก seed ด้วย seed นั้นๆ) แยกไม่
+    # ออกว่าตัวเลขที่ต่างกันมาจากอะไร และเทียบ per-seed กับ
+    # Anomaly-Detection-THESIS/PatchCore repo ตรงๆ ไม่ได้อีกต่อไป (เว้นแต่
+    # repo อื่นจะ regenerate split ด้วย seed เดียวกันแบบนี้เหมือนกันทุกที่)
+    # ถ้าต้องการเทียบ metric เฉลี่ยรวม (mean±std ข้าม seed) เพื่อดู
+    # "ความเสถียรของ method" อย่างเดียว ไม่ได้สนใจเทียบ per-image กับ
+    # baseline อื่น แบบนี้ก็ใช้ได้ปกติ
+    SPLIT_CACHE_PATH="save/SEED 42/split/split_assignment.csv",
+    SAVE_PATH="save/SEED 42/log",
+    OUTPUT_PATH="save/SEED 42/table",
     SEED=42,
 
     # ── Model config — ปรับได้ตามต้องการ ────────────────────────────
@@ -71,6 +79,10 @@ OVERRIDES = dict(
     DFR_EPOCHS=100,
     DFR_LR=1e-4,
     THRESHOLD_PERCENTILE=95.0,
+    # จำกัด peak GPU memory ของขั้น align (paper eq. 1) — ดู docstring ของ
+    # src/models/dfr.py::_regional_feature_map ถ้าเจอ CUDA OOM ให้ลดค่านี้
+    # ลงก่อน (เช่น 4 หรือ 2) แทนการลด BATCH_SIZE เอง
+    DFR_FEATURE_CHUNK_SIZE=8,
 
     # ── ConvNeXt variant (apples-to-apples กับ EXPERIMENT 0/PatchCore/PaDiM) ──
     # ยังไม่ฟันธงว่า thesis จะใช้แบบไหน — ถ้าตัดสินใจแล้วอยากสลับ ลบ 6 key

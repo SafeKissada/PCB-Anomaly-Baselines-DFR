@@ -52,6 +52,51 @@ import numpy as np
 from sklearn.metrics import roc_curve
 
 
+def _labeled_confusion_matrix(cm: np.ndarray) -> dict:
+    """แปลง sklearn confusion_matrix(gt, pred, labels=[0,1]) (เข้ารหัสเป็น
+    [[tn, fp], [fn, tp]] แบบไม่มี label กำกับ) เป็น dict ที่บอกชัดว่าค่า
+    ไหนคือ TT/TF/FT/FF ตาม convention ของโปรเจกต์นี้ (ดู
+    src/evaluate.py::compute_metrics_from_predictions ซึ่งใช้ชื่อเดียวกัน
+    กับ naive_baselines ใน final_results.json — ฟังก์ชันนี้แค่คำนวณค่า
+    เดียวกันจาก cm ของโมเดลจริงที่ compute_metrics() คืนมา ไม่ได้แก้
+    src/evaluate.py เอง เพราะไฟล์นั้นต้อง verbatim เหมือน repo อื่น)
+
+    Convention (ตัวอักษรแรก = actual label, ตัวอักษรที่สอง = predicted label
+    — T แปลว่า anomaly/defect, F แปลว่า normal/good):
+      TT = actual anomaly, predicted anomaly → จับ defect ได้ถูก (true positive)
+      TF = actual anomaly, predicted normal  → defect หลุดผ่าน / escape (false negative)
+      FT = actual normal,  predicted anomaly → false alarm (false positive)
+      FF = actual normal,  predicted normal  → auto-clear ถูกต้อง (true negative)
+
+    Converts sklearn's confusion_matrix(gt, pred, labels=[0,1]) (encoded as
+    the unlabeled [[tn, fp], [fn, tp]]) into a dict that explicitly states
+    which value is TT/TF/FT/FF per this project's convention (same names
+    used in naive_baselines — this function only recomputes the same
+    quantities from the real model's cm, without touching src/evaluate.py
+    itself, since that file must stay byte-identical to the other repos).
+    """
+    cm = np.asarray(cm)
+    tn, fp, fn, tp = int(cm[0, 0]), int(cm[0, 1]), int(cm[1, 0]), int(cm[1, 1])
+    return {
+        "tt": tp,  # actual anomaly, predicted anomaly -> caught defect
+        "tf": fn,  # actual anomaly, predicted normal   -> escaped/missed defect
+        "ft": fp,  # actual normal,  predicted anomaly  -> false alarm
+        "ff": tn,  # actual normal,  predicted normal   -> correctly auto-cleared
+        "definitions": {
+            "tt": "actual=anomaly(defect), predicted=anomaly -> caught defect (true positive)",
+            "tf": "actual=anomaly(defect), predicted=normal  -> escaped/missed defect (false negative)",
+            "ft": "actual=normal(good),    predicted=anomaly -> false alarm (false positive)",
+            "ff": "actual=normal(good),    predicted=normal  -> correctly auto-cleared (true negative)",
+        },
+        "sklearn_raw_cm": cm.tolist(),
+        "sklearn_raw_cm_note": (
+            "confusion_matrix(y_true, y_pred, labels=[0,1]) -> "
+            "[[tn, fp], [fn, tp]], where 0=normal/good, 1=anomaly/defect "
+            "(tn==ff, fp==ft, fn==tf, tp==tt above)"
+        ),
+    }
+
+
 # ── SAVE_PATH artifacts (ตัวเลข/log) ─────────────────────────────────────
 
 def save_final_results(cfg, split_name: str, metrics: dict,
@@ -64,15 +109,24 @@ def save_final_results(cfg, split_name: str, metrics: dict,
 
     naive_baselines: dict จาก compute_naive_baseline_metrics() —
     เก็บ 3 baseline (always_normal, always_anomaly, random_prior) พร้อม
-    seed เพื่อให้ผล random_prior reproduce ได้ข้าม run
+    seed เพื่อให้ผล random_prior reproduce ได้ข้ามรัน
 
     extra_fields: dict เสริมของ method-specific hyperparameter (เช่น
     DFR: {"dfr_epochs": cfg.DFR_EPOCHS, "latent_dim": actual_latent_dim})
     ถูก merge เข้า top-level ของ JSON ตรงๆ — ไม่บังคับส่ง
 
+    "confusion_matrix" ใน JSON ที่ได้ ตอนนี้เป็น dict ที่บอกชัดว่าค่าไหน
+    คือ tt/tf/ft/ff (ไม่ใช่ array 2x2 เปล่าๆ แบบเดิมที่ต้องเปิดโค้ดไปดูว่า
+    index ไหนคืออะไร) — ดู _labeled_confusion_matrix() ด้านบน
+
     final_results_{split_name}.json goes to SAVE_PATH — same format as the
     main repo (config snapshot + metrics + naive_baselines) so cross-repo
     comparison scripts load the same keys without modification.
+
+    "confusion_matrix" in the resulting JSON is now a dict that explicitly
+    states which value is tt/tf/ft/ff (rather than the previous bare 2x2
+    array that required reading the code to know which index meant what)
+    — see `_labeled_confusion_matrix()` above.
     """
     out = {
         "experiment"           : cfg.EXPERIMENT,
@@ -88,7 +142,7 @@ def save_final_results(cfg, split_name: str, metrics: dict,
         "metrics" : {k: (v.tolist() if hasattr(v, 'tolist') else v)
                      for k, v in metrics.items()
                      if k not in ("cm", "fpr", "tpr", "gt", "pred", "scores")},
-        "confusion_matrix" : metrics["cm"].tolist(),
+        "confusion_matrix" : _labeled_confusion_matrix(metrics["cm"]),
     }
     if extra_fields:
         out.update(extra_fields)
@@ -274,7 +328,10 @@ def write_save_path_readme(cfg) -> Path:
         "scores_test.npz": "เหมือน scores_val.npz แต่สำหรับ test split",
         "final_results_val.json": (
             "config snapshot + metrics ครบชุด (val) — "
-            "เทียบ AUROC/escape_rate กับ repo อื่นได้โดยตรง"
+            "เทียบ AUROC/escape_rate กับ repo อื่นได้โดยตรง "
+            "confusion_matrix เป็น dict ที่บอกชัดว่าค่าไหนคือ tt/tf/ft/ff "
+            "(TT=จับ defect ได้ถูก, TF=defect หลุด/escape, FT=false alarm, "
+            "FF=auto-clear ถูกต้อง — มี key 'definitions' อธิบายอีกชั้นในไฟล์)"
         ),
         "final_results_test.json": "เหมือน final_results_val.json แต่สำหรับ test split",
         "roc_curve_data_val.csv": (

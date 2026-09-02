@@ -16,9 +16,12 @@ Runs DFR end-to-end on the same dataset as the main repo
 (Anomaly-Detection-THESIS) — metrics compare directly against EXPERIMENT 0
 (ConvNeXt+AE) and PatchCore since they share the same split/evaluate code.
 """
+import gc
 import logging
 import sys
 from pathlib import Path
+
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -139,6 +142,16 @@ def run(cfg: Config):
 
     # README เขียนท้ายสุดหลังทุก split เสร็จ เพื่อให้ list ไฟล์ครบ
     write_save_path_readme(cfg)
+
+    # ปล่อย GPU memory ของ backbone+CAE ทันทีที่ใช้เสร็จ — สำคัญเวลาเรียก
+    # run() ซ้ำหลายรอบในโปรเซสเดียว (เช่น จาก RUN_MULTI_SEED.py) ไม่งั้น
+    # CUDA caching allocator จะสะสม reserved memory ไปเรื่อยๆ จน OOM ทั้งที่
+    # แต่ละรอบเดี่ยวๆ ใช้ memory ไม่เยอะขนาดนั้น (ดู RUN_MULTI_SEED.py
+    # หัวไฟล์สำหรับรายละเอียดเต็ม)
+    del model
+    gc.collect()
+    if cfg.DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
 
     logger.info(
         f"All artifacts saved → SAVE_PATH: {cfg.SAVE_PATH}"
