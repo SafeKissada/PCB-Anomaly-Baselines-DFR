@@ -6,16 +6,18 @@ arXiv:2012.07122) for the PCB defect-inspection thesis project — a
 literature/SOTA comparison row alongside `Anomaly-Detection-THESIS`
 (EXPERIMENT 0, ConvNeXt+AE) and `PCB-Anomaly-Baselines-PatchCore`.
 
-**This version implements DFR as close to the original paper as
-practical, by default** — VGG19 backbone, nearest-neighbor align +
-mean-filter aggregation (paper eq. 1-2), no feature normalization,
-reflection padding (paper §IV-C.2) — rather than adapting it to match
-EXPERIMENT 0's ConvNeXt/z-score conventions. This is deliberate: the
-thesis hasn't decided yet which backbone/normalization it will ultimately
-use, so this repo keeps a literature-faithful DFR available as a clean
-reference point, uncontaminated by the thesis's own design choices. Every
-one of these choices is still a plain `Config` field — switch to the
-ConvNeXt-matched variant any time (see below) without touching code.
+**`RUN.py`'s active config is now ConvNeXt-tiny Stage2+3+4** — the same
+backbone family as EXPERIMENT 0/PatchCore/PaDiM, chosen deliberately so
+this baseline's numbers isolate DFR's *method* (CAE design, reconstruction
+scoring) rather than being confounded by backbone differences (VGG19 is a
+much older architecture than ConvNeXt; if DFR-on-VGG19 loses to
+ConvNeXt-based EXPERIMENT 0, that comparison wouldn't say anything about
+the *method*). `config/config.py`'s raw dataclass defaults stay VGG19 —
+paper-faithful (nearest-neighbor align, mean-filter aggregation per paper
+eq. 1-2, no feature normalization, reflection padding per paper §IV-C.2) —
+as a literature-reproduction reference, separate from what `RUN.py`
+actually runs. Every one of these choices is a plain `Config` field —
+switch between them any time (see below) without touching code.
 
 ## Quickstart
 
@@ -32,23 +34,26 @@ ConvNeXt-matched variant any time (see below) without touching code.
    localizes the synthetic patch correctly — see "Heatmap sanity check
    finding" below for why this matters.
 4. `python RUN.py` — fit → score → save → visualize → cost-aware sweep.
-5. Outputs: `SAVE_PATH` (default `save/logs`) for `.npz`/`.json`/`.csv`/
-   `history.json`; `OUTPUT_PATH` (default `save/results`) for all `.png`
-   plots including `training_history.png`.
+5. Outputs: `SAVE_PATH` (default `save/SEED 42/log`) for `.npz`/`.json`/
+   `.csv`/`history.json`; `OUTPUT_PATH` (default `save/SEED 42/table`) for
+   all `.png` plots including `training_history.png`.
 
-## Switching to the ConvNeXt-matched variant
+## ConvNeXt (active default) vs. VGG19 (paper-faithful) — when to use which
 
-If/when the thesis settles on comparing every baseline with the same
-backbone as EXPERIMENT 0, replace these 6 `OVERRIDES` keys in `RUN.py`:
+| Use case | Backbone | Why |
+|---|---|---|
+| Main comparison table vs. EXPERIMENT 0/PatchCore/PaDiM | **ConvNeXt-tiny Stage2+3+4** (`RUN.py` default now) | Same backbone family across every baseline — isolates the *algorithm* difference, matching how PatchCore/PaDiM/SimpleNet papers compare against each other |
+| Sanity-check that this reimplementation reproduces the paper's own numbers | **VGG19 front-12** (`config/config.py` raw default) | Confirms the code is a faithful DFR implementation, not a broken one — useful as an appendix/footnote, not the headline comparison |
 
-```python
-BACKBONE="convnext_tiny",
-FEATURE_LAYERS=("features.3", "features.5"),
-DFR_ALIGN_MODE="bilinear",
-NORMALIZE_FEATURES=True,
-# DFR_AGG_KERNEL / DFR_AGG_STRIDE / DFR_REFLECTION_PADDING can stay at
-# their defaults either way.
-```
+Module names for ConvNeXt-tiny were verified against the actual
+`torchvision.models.convnext_tiny()` via forward hooks (not guessed):
+`features.3`=Stage2 (192ch, 28×28 @ 224×224 input), `features.5`=Stage3
+(384ch, 14×14), `features.7`=Stage4 (768ch, 7×7) — `c_in = 1344` combined,
+actually lighter than VGG19 front-12's `c_in = 3456`.
+
+To switch back to the VGG19 variant in `RUN.py`, see the commented block
+right below the active `OVERRIDES` (swap the 6 keys `BACKBONE` through
+`NORMALIZE_FEATURES`).
 
 ## Files reused verbatim from PCB-Anomaly-Baselines-PatchCore / Anomaly-Detection-THESIS
 
@@ -134,6 +139,12 @@ real GPU hardware could not be executed and observed in this sandbox. If
 
 ## Differences from the original DFR paper (stated explicitly)
 
+These describe `config/config.py`'s raw `Config` dataclass defaults (the
+paper-faithful reference) — **not** what `RUN.py` actually runs by
+default anymore (`RUN.py` now uses ConvNeXt Stage2+3+4, see "ConvNeXt vs.
+VGG19" above). Instantiating `Config()` with no overrides still gives you
+this literature-faithful setup.
+
 1. **Backbone default**: VGG19 front-12 layers (`VGG19_FRONT_12_LAYERS` /
    the first 12 entries of `VGG19_ALL_16_LAYERS` in `src/models/dfr.py`,
    verified against the actual `torchvision.models.vgg19().features`
@@ -173,6 +184,35 @@ While building this repo I verified this is not a minor effect:
 - `src/models/dfr.py::_FeatureExtractor` now does this switch automatically
   whenever `cfg.DFR_REFLECTION_PADDING=True` (default), for whichever
   `BACKBONE` is configured.
+
+### Reflection padding + small IMAGE_SIZE — a real edge case
+
+Reflection padding requires `padding < spatial size` for every convolution
+(zero-padding has no such constraint). This can break for **deep** layers
+combined with a **small** `IMAGE_SIZE`: e.g. ConvNeXt Stage4
+(`features.7`) downsamples by 32× from the input, so at `IMAGE_SIZE=96` it
+shrinks to 3×3 — too small for ConvNeXt's 7×7 depthwise convs
+(`padding=3`, which needs spatial ≥ 4). This was caught during development
+(a quick integration test using a small dummy image size hit it
+immediately) and is now a clear, actionable error instead of a raw
+PyTorch stack trace — `_FeatureExtractor.forward()` catches this specific
+failure and tells you exactly what to do:
+
+```
+Reflection padding พังเพราะ IMAGE_SIZE เล็กเกินไปสำหรับ BACKBONE=ConvNeXt +
+FEATURE_LAYERS=(...) — ... แก้ได้ 2 ทาง: (1) เพิ่ม IMAGE_SIZE ... หรือ
+(2) ตั้ง DFR_REFLECTION_PADDING=False ...
+```
+
+**Verified safe**: the real default (`IMAGE_SIZE=224`, ConvNeXt
+Stage2+3+4) does **not** hit this — Stage4 lands at 7×7, and `3 < 7`
+passes. Confirmed via a full `run_dfr.run()` pass at `IMAGE_SIZE=224` with
+the exact `RUN.py` `OVERRIDES` (PCA landed on 435 latent dims from 1344
+input channels; `AUC=1.0` on both val/test on the dummy data). Only
+relevant if you deliberately lower `IMAGE_SIZE` below roughly 112–128 for
+speed while using deep layers like ConvNeXt Stage4 or VGG19's later
+layers — if you do, either raise `IMAGE_SIZE` back up or set
+`DFR_REFLECTION_PADDING=False` for that run.
 
 ## Heatmap sanity check finding — read before trusting real results
 
@@ -312,6 +352,69 @@ which must stay byte-identical to the other repos):
 `F`=normal/good. Cross-checked against the sibling `metrics` fields:
 `escape_rate = tf/(tt+tf)`, `auto_clear_rate = ff/n`,
 `residual_fcr = ft/(tt+ft)`.
+
+## MVTec AD reproduction (separate pipeline — not the PCB thesis one)
+
+`scripts/run_dfr.py`/`RUN.py` (everything above) target the **PCB thesis
+dataset** — group-based random split, image-level classification metrics.
+Reproducing the DFR **paper's own** published numbers (Table II/III)
+needs a genuinely different pipeline, added as a **parallel, additive**
+set of files — nothing above was touched:
+
+| New file | Purpose |
+|---|---|
+| `config/mvtec_config.py` | `MVTecConfig` — separate dataclass, paper-exact defaults (VGG19, `IMAGE_SIZE=(256,256)`, `BATCH_SIZE=4`, `DFR_EPOCHS=700`, no feature normalization, reflection padding on) |
+| `src/data/mvtec_dataset.py` | Parses MVTec's official `train/`/`test/`/`ground_truth/` layout; reuses `AnomalyDataset`/`build_transforms`/`make_loader` from the verbatim `dataset.py` directly (same preprocessing as every other baseline) |
+| `src/mvtec_evaluate.py` | Pixel-level ROC-AUC + region-level PRO-AUC (paper §IV-A.5's actual protocol — connected-component overlap, normalized to ≤30% average pixel-FPR) |
+| `scripts/run_dfr_mvtec.py` | Loops over categories, trains+scores DFR per category, prints/saves a Table II/III-style summary |
+| `tests/mvtec_metric_unit_test.py` | Validates `pixel_roc_auc`/`pro_auc` against synthetic ground truth with known answers (perfect prediction → ~1.0, random → ~0.5/low, all-normal → NaN not a crash, partial overlap → sane middle value) — **run this before trusting the metric on anything else** |
+| `tests/mvtec_pipeline_test.py` | Full structural test: builds a fake MVTec-formatted folder tree (`train/good`, `test/good`, `test/{defect}`, `ground_truth/{defect}/*_mask.png`), runs the entire pipeline through it |
+
+### Why `dataset.py`/`evaluate.py` weren't extended instead
+
+MVTec's train/test split is **fixed by the dataset**, not computed — using
+`dataset.py`'s group-based random-split logic would silently produce a
+non-standard split incomparable to any published number, defeating the
+entire point of "reproducing the paper." Its headline metrics are also
+fundamentally different (pixel/region-level, not image classification), so
+`evaluate.py`'s `compute_metrics()` doesn't apply either. Keeping this as
+a separate, additive path avoids two bad options: bolting MVTec-specific
+branches onto the verbatim PCB files (breaking their "byte-identical
+across repos" guarantee), or silently reusing them in a way that produces
+plausible-looking but methodologically wrong numbers.
+
+### What's actually verified vs. not
+
+- **Metric correctness**: `tests/mvtec_metric_unit_test.py` passes —
+  perfect prediction gives ROC-AUC=1.000/PRO-AUC=1.000, random prediction
+  gives ROC-AUC≈0.49/PRO-AUC=0.15 (low), all-normal masks return `NaN`
+  without crashing, partial region overlap gives PRO-AUC=0.75 (a sane
+  middle value, not a degenerate 0 or 1).
+- **Pipeline mechanics**: `tests/mvtec_pipeline_test.py` passes on a
+  synthetic fake-MVTec folder tree — folder parsing, mask loading/lookup,
+  `DFR.fit()`/`.score()`, and both metrics all run correctly together
+  (ROC-AUC≈0.99, PRO-AUC≈0.96 on an easy synthetic anomaly, with
+  `PRETRAINED=False` and only 3 epochs).
+- **NOT verified: real MVTec AD numbers.** This sandbox has no network
+  access to any MVTec AD download source (official site or mirrors) — none
+  of the domains needed are in the allowed list. **You must download and
+  extract MVTec AD yourself** (official page:
+  `https://www.mvtec.com/company/research/datasets/mvtec-ad`, ~4.9 GB) and
+  point `MVTEC_ROOT` in `scripts/run_dfr_mvtec.py`'s `main()` call at the
+  extracted folder, then run:
+  ```bash
+  python -c "
+  from config.mvtec_config import MVTecConfig
+  from scripts.run_dfr_mvtec import main
+  main(MVTecConfig(MVTEC_ROOT='/path/to/mvtec_anomaly_detection'))
+  "
+  ```
+  With the paper's own settings (`DFR_EPOCHS=700`, all 15 categories),
+  expect this to take hours per category on GPU — start with
+  `CATEGORIES=("carpet",)` to sanity-check one category first. Compare
+  the resulting `roc_auc`/`pro_auc` against paper Table II/III's "Ours
+  f{1:12}" column (this repo's `FEATURE_LAYERS` default) before trusting
+  a full 15-category run.
 
 ## Verified end-to-end (dummy data, offline backbone)
 

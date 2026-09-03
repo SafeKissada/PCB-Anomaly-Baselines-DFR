@@ -185,7 +185,36 @@ class _FeatureExtractor(torch.nn.Module):
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> "list[torch.Tensor]":
         self._features = {}
-        self.backbone(x)
+        try:
+            self.backbone(x)
+        except RuntimeError as e:
+            if "Padding size should be less than" in str(e):
+                # Reflection padding (paper §IV-C.2, DFR_REFLECTION_PADDING)
+                # ต้องการ padding size < ขนาด spatial ของ feature map ณ
+                # ตำแหน่งนั้นเสมอ (ต่างจาก zero-padding ที่ไม่มีข้อจำกัดนี้)
+                # — พังตอน IMAGE_SIZE เล็กเกินไปจนทำให้ layer ลึกๆ (เช่น
+                # ConvNeXt Stage4 ที่ downsample 32x จาก input) เหลือ spatial
+                # size เล็กกว่า padding ที่ layer นั้นต้องการ (เช่น 7x7
+                # depthwise conv, padding=3, ต้องการ spatial >= 4)
+                # ยืนยันแล้วว่า IMAGE_SIZE=224 (default ของ config.py) กับ
+                # ConvNeXt Stage2+3+4 ไม่ชนปัญหานี้ (Stage4 ออกมา 7x7,
+                # 3 < 7 ผ่าน) แต่ IMAGE_SIZE <= ~112 กับ Stage4 จะพัง —
+                # ดู README หัวข้อ "Reflection padding + small IMAGE_SIZE"
+                raise RuntimeError(
+                    f"Reflection padding พังเพราะ IMAGE_SIZE เล็กเกินไปสำหรับ "
+                    f"BACKBONE={self.backbone.__class__.__name__} + "
+                    f"FEATURE_LAYERS={self.layers} — layer ลึกๆ มี spatial "
+                    f"size เหลือน้อยกว่า padding ที่ conv layer นั้นต้องการ "
+                    f"(reflect padding ต้องการ padding < spatial size เสมอ, "
+                    f"ต่างจาก zero-padding ที่ไม่มีข้อจำกัดนี้) แก้ได้ 2 ทาง: "
+                    f"(1) เพิ่ม IMAGE_SIZE ใน config (224 ใช้ได้กับ ConvNeXt "
+                    f"Stage2+3+4 แน่นอน ยืนยันแล้ว) หรือ (2) ตั้ง "
+                    f"DFR_REFLECTION_PADDING=False (กลับไปใช้ zero-padding "
+                    f"ปกติ ไม่มีข้อจำกัดนี้ แต่จะเจอ boundary-effect artifact "
+                    f"ตามที่ paper §IV-C.2 อธิบายไว้แทน — ดู README หัวข้อ "
+                    f"'Reflection padding')\n\nOriginal error: {e}"
+                ) from e
+            raise
         return [self._features[name] for name in self.layers]
 
     def remove_hooks(self):

@@ -58,24 +58,28 @@ OVERRIDES = dict(
     SEED=42,
 
     # ── Model config — ปรับได้ตามต้องการ ────────────────────────────
-    # ค่า default ทั้งหมดด้านล่างนี้ "ตรงตาม paper" (VGG19 front-12,
-    # nearest-neighbor align, mean-filter aggregate 4/4, ไม่ normalize) —
-    # ไม่ได้ override ไปจาก config/config.py เลย เขียนไว้ตรงนี้ซ้ำเพื่อให้
-    # เห็นชัดว่าอยากรันแบบไหน ไม่ต้องเปิด config.py ไปดู ถ้าจะสลับไปเทียบ
-    # backbone เดียวกับ EXPERIMENT 0/PatchCore/PaDiM แทน ดูตัวอย่าง
-    # ConvNeXt variant ที่ comment ไว้ด้านล่าง
-    EXPERIMENT="DFR_group1_VGG19_paper_faithful",
-    BACKBONE="vgg19",
-    FEATURE_LAYERS=(
-        "features.1",  "features.3",  "features.6",  "features.8",
-        "features.11", "features.13", "features.15", "features.17",
-        "features.20", "features.22", "features.24", "features.26",
-    ),  # front-12 ของ VGG19 (paper section IV-C.1) — ดู
-        # src.models.dfr.VGG19_ALL_16_LAYERS ถ้าต้องการครบ 16 scale เต็ม
-    DFR_ALIGN_MODE="nearest",
+    # ตั้งเป็น ConvNeXt Stage2+3+4 (apples-to-apples กับ EXPERIMENT 0/
+    # PatchCore/PaDiM ในโปรเจกต์นี้ทุกตัว) — เลือกแบบนี้แทน VGG19 เพราะ
+    # ต้องการแยกให้ออกว่า thesis ดีขึ้นเพราะ "วิธีการ" (CAE design/training)
+    # ไม่ใช่แค่เพราะ backbone ใหม่กว่า ถ้า DFR ใช้ VGG19 (network เก่ากว่า
+    # ConvNeXt มาก) แล้ว thesis ชนะ จะสรุปไม่ได้ว่าชนะเพราะอะไร — งานวิจัย
+    # anomaly detection ที่ตีพิมพ์ (PatchCore/PaDiM/SimpleNet) ก็ fix
+    # backbone ให้เหมือนกันทุก method เวลาเทียบกันเองเสมอ
+    #
+    # module name verified จริงกับ torchvision.models.convnext_tiny()
+    # ด้วย forward hook (ไม่ได้เดา):
+    #   features.3 = Stage2 output (192ch, 28x28 @ input 224x224)
+    #   features.5 = Stage3 output (384ch, 14x14)
+    #   features.7 = Stage4 output (768ch, 7x7)
+    #   รวม c_in = 192+384+768 = 1344 channel (เบากว่า VGG19 front-12
+    #   ที่ c_in=3456 ด้วยซ้ำ)
+    EXPERIMENT="DFR_group1_ConvNeXt_Stage2+3+4",
+    BACKBONE="convnext_tiny",
+    FEATURE_LAYERS=("features.3", "features.5", "features.7"),
+    DFR_ALIGN_MODE="bilinear",
     DFR_AGG_KERNEL=4,
     DFR_AGG_STRIDE=4,
-    NORMALIZE_FEATURES=False,
+    NORMALIZE_FEATURES=True,
     DFR_EPOCHS=100,
     DFR_LR=1e-4,
     THRESHOLD_PERCENTILE=95.0,
@@ -84,13 +88,20 @@ OVERRIDES = dict(
     # ลงก่อน (เช่น 4 หรือ 2) แทนการลด BATCH_SIZE เอง
     DFR_FEATURE_CHUNK_SIZE=8,
 
-    # ── ConvNeXt variant (apples-to-apples กับ EXPERIMENT 0/PatchCore/PaDiM) ──
-    # ยังไม่ฟันธงว่า thesis จะใช้แบบไหน — ถ้าตัดสินใจแล้วอยากสลับ ลบ 6 key
-    # ด้านบน (BACKBONE ถึง NORMALIZE_FEATURES) ออก แล้วแทนด้วย:
-    #   BACKBONE="convnext_tiny",
-    #   FEATURE_LAYERS=("features.3", "features.5"),
-    #   DFR_ALIGN_MODE="bilinear",
-    #   NORMALIZE_FEATURES=True,
+    # ── VGG19 variant (paper-faithful, สำหรับ reproduce ตัวเลขใน paper) ──
+    # ยังไม่ฟันธงว่า thesis จะใช้แบบไหนตลอด — ถ้าอยากสลับกลับไปดูว่า
+    # reproduce ตรงกับ paper ต้นฉบับไหม (ตัวเลข ROC-AUC/PRO-AUC ใน paper
+    # section IV-B วัดจาก VGG19) ลบ 6 key ด้านบน (BACKBONE ถึง
+    # NORMALIZE_FEATURES) ออก แล้วแทนด้วย:
+    #   BACKBONE="vgg19",
+    #   FEATURE_LAYERS=(
+    #       "features.1",  "features.3",  "features.6",  "features.8",
+    #       "features.11", "features.13", "features.15", "features.17",
+    #       "features.20", "features.22", "features.24", "features.26",
+    #   ),  # front-12 (paper section IV-C.1) — ดู
+    #       # src.models.dfr.VGG19_ALL_16_LAYERS ถ้าต้องการครบ 16 scale เต็ม
+    #   DFR_ALIGN_MODE="nearest",
+    #   NORMALIZE_FEATURES=False,
     # (DFR_AGG_KERNEL/DFR_AGG_STRIDE ยังใช้ค่า default 4/4 ได้ตามปกติ)
 )
 
